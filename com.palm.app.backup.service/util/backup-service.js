@@ -10,7 +10,7 @@
  * .enc and getFinalPath has no encrypted branch — see util/file-util.js for
  * why.
  */
-/*global DB, Future, FILES_PATH, MANIFESTS_PATH, MANIFEST_ROOT, fileUtil,
+/*global DB, Future, FILES_PATH, MANIFESTS_PATH, RECEIPTS_PATH, MANIFEST_ROOT, fileUtil,
   logger, mapFuture, privileged, removeAll, require, system, userData, isEmptyObject,
   STATIC_SERVICES_ROOT,
   zeroPad, dateUtil */
@@ -84,6 +84,28 @@ var backup = (function () {
                 logger.warn("Status listener threw:", err.message);
             }
         });
+    };
+
+    /**
+     * A one-line note about what the run is doing right now, e.g. the app it is
+     * archiving. Purely cosmetic: the app shows it instead of the generic
+     * "Backing up..." while it is set, and falls back when it is not.
+     *
+     * Fires immediately rather than going through incrementProgress's 0.5%
+     * throttle - the whole point is the phases where the percentage does NOT
+     * move, so throttling on percentage would suppress exactly the updates
+     * that matter.
+     */
+    that.setStatusDetail = function (text) {
+        if (!status) {
+            return;
+        }
+        if (text) {
+            status.detail = text;
+        } else {
+            delete status.detail;
+        }
+        fireStatusChanged();
     };
 
     var setStatus = function (s) {
@@ -597,8 +619,95 @@ var backup = (function () {
     };
 
     /**
+     * Writes a restore receipt to the target.
+     *
+     * Named for the manifest it restored plus the count, so repeated restores
+     * of one backup do not overwrite each other's record - "it worked the first
+     * time and not the second" is exactly the kind of thing you want to be able
+     * to see afterwards.
+     *
+     * Deliberately simpler than storeManifest: there is no local cache to keep
+     * in step, and nothing reads a receipt back, so it is a straight upload.
+     */
+    that.storeRestoreReceipt = function (target, receipt, manifestName) {
+        var name = manifestName + "-restore-" + zeroPad(receipt.restoreCount || 1, 2) + ".json";
+        var temp = MANIFEST_ROOT + "receipt-temp";
+        var future = fileUtil.writeJson(temp, receipt);
+
+        future.then(this, function (f) {
+            var result = f.result;
+            f.nest(target.putFile(RECEIPTS_PATH + name, temp));
+        });
+        future.then(this, function (f) {
+            var err = f.exception;
+            var cleanup = fileUtil.rmIfExists(temp);
+            cleanup.then(this, function (cf) {
+                if (cf.exception) {
+                    logger.warn("Could not remove the scratch receipt:",
+                        cf.exception.message);
+                }
+                cf.exception = err;      // undefined on success: carries nothing
+                cf.result = name;
+            });
+            f.nest(cleanup);
+        });
+        return future;
+    };
+
+    /**
+     * Re-fetches one manifest, overwriting the cached copy.
+     *
+     * A fetch that fails REMOVES the local copy instead of leaving it in place:
+     * an unverified cache entry is the whole problem this sync exists to avoid,
+     * and a manifest we could not read from the target is exactly that. Never
+     * rejects, so one unreachable manifest cannot abort the sync for the rest
+     * (mapFuture chains sequentially and an exception would strand the others).
+     */
+    var refetchManifest = function (target, name, failed) {
+        var future = target.get(MANIFESTS_PATH + name, MANIFEST_ROOT + name);
+        future.then(this, function (f) {
+            if (!f.exception) {
+                f.result = name;
+                return;
+            }
+            logger.warn("Could not fetch manifest", name, "-", f.exception.message,
+                "- dropping the cached copy rather than trusting it");
+            failed.push(name);
+            var cleanup = fileUtil.rmIfExists(MANIFEST_ROOT + name);
+            cleanup.then(this, function (cf) {
+                cf.exception = undefined;   // handled: do not strand the chain
+                cf.result = name;
+            });
+            f.nest(cleanup);
+        });
+        return future;
+    };
+
+    /**
      * Brings the local manifest cache in line with the target and returns the
      * name of the newest manifest, which is what the next name is derived from.
+     *
+     * The target is the source of truth for CONTENT, not just for existence.
+     * That distinction is the fix for a restore that failed with "Error
+     * restoring data" and still reported success: manifest names are
+     * NNNNNN-<nduId> and are NOT unique -- the counter restarts whenever a
+     * store is cleared, while /media/internal survives a Doctor flash. So a
+     * stale 000001-19Q from an earlier restore can name a completely different
+     * backup than the target's 000001-19Q. This used to reconcile by NAME only
+     * (fetch what we lack, drop what the target lacks), which left any name
+     * present on BOTH sides untouched -- the stale local copy silently shadowed
+     * the real one. Measured once: the device read a 6-file manifest, restored
+     * 6 files out of a 115-package backup, and called it a success.
+     *
+     * Hence: re-fetch every manifest the target lists. There is no cheaper
+     * content test available. list() reports an Etag only for the
+     * content-addressed files/ store -- manifests carry none; a size comparison
+     * is specifically weak here because manifests list fixed-width checksums,
+     * so two different ones can share a byte length; get() does not preserve
+     * mtime, so a size+mtime mirror test degenerates to this anyway; and the
+     * nduId inside the manifest cannot help either, because the colliding
+     * copies come from the same device and carry the same one. Manifests are
+     * small JSON and their number is bounded by trimManifests().
      */
     that.syncManifests = function (target) {
         var targetManifests = [];
@@ -621,19 +730,18 @@ var backup = (function () {
         future.then(this, function (f) {
             var localManifests = f.result;
 
-            // Anything the target has and we do not, fetch.
-            var missing = removeAll(targetManifests, localManifests);
-            // Anything we have and the target does not, drop: the target is the
-            // source of truth, and a stale local entry would show a backup in
-            // the restore list that cannot actually be restored.
+            // Anything we have and the target does not, drop: a stale local
+            // entry would show a backup in the restore list that cannot
+            // actually be restored.
             var stale = removeAll(localManifests, targetManifests);
+            var failed = [];
 
             var work = fileUtil.mkdirs(MANIFEST_ROOT);
             work.then(this, function (wf) {
                 var result = wf.result;
-                wf.nest(mapFuture(missing, function (name) {
-                    logger.log("Fetching manifest", name);
-                    return target.get(MANIFESTS_PATH + name, MANIFEST_ROOT + name);
+                // EVERY manifest, not just the ones we are missing -- see above.
+                wf.nest(mapFuture(targetManifests, function (name) {
+                    return refetchManifest(target, name, failed);
                 }));
             });
             work.then(this, function (wf) {
@@ -642,6 +750,19 @@ var backup = (function () {
                     logger.log("Dropping stale cached manifest", name);
                     return fileUtil.rmIfExists(MANIFEST_ROOT + name);
                 }));
+            });
+            work.then(this, function (wf) {
+                var result = wf.result;
+                logger.log("Manifest cache synced:",
+                    targetManifests.length - failed.length, "of",
+                    targetManifests.length, "refreshed from the target;",
+                    stale.length, "stale dropped" +
+                    (failed.length ? "; UNFETCHABLE: " + failed.join(", ") : ""));
+                // Hand the value back on: a then() that reads the result and
+                // neither nests nor re-assigns leaves the future with no value,
+                // and every later then() silently never runs -- the handler just
+                // never replies.
+                wf.result = result;
             });
             f.nest(work);
         });
