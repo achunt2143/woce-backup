@@ -23,7 +23,7 @@
 /*global Future, FILES_PATH, MANIFESTS_PATH, MANIFEST_ROOT, PalmCall, STAGE_ROOT,
   packageOpWrapperBudget, serviceCallTimeout, backup, dateUtil, eliminateDuplicates,
   fileUtil, isEmpty, isEmptyObject, logger, mapFuture, objectEquals, prefs,
-  privileged, require, system, targets, tolerate, userData, withDeadline,
+  credentials, privileged, require, system, targets, tolerate, userData, withDeadline,
   withTimeout, zeroPad */
 
 function BackupAssistant() {
@@ -230,6 +230,9 @@ function BackupAssistant() {
         if (descriptor && descriptor.inProcess) {
             if (serviceName === userData.SERVICE_ID) {
                 return userData[method](params);
+            }
+            if (serviceName === credentials.SERVICE_ID) {
+                return credentials[method](params);
             }
             throw new Error("No in-process provider for " + serviceName);
         }
@@ -615,6 +618,15 @@ function BackupAssistant() {
         var tempDirFuture;
         var preferences;
         var packageFiles;   // [{path}], the .ipks archivePackages actually found
+        // id -> why its archive failed. Populated when the helper answers and
+        // read three callbacks later, so it lives out here rather than in the
+        // callback that fills it.
+        var archiveFailures = {};
+        // Accumulated across the per-package archive calls below and read in
+        // the callback after them, so they live at run scope.
+        var archivedAll = [];
+        var archivedDirsAll = [];
+        var failuresAll = [];
 
         future.nest(prefs.get());
         future.then(this, function (f) {
@@ -770,14 +782,32 @@ function BackupAssistant() {
                 // gives the helper's own job a 60s budget for it - the blanket
                 // 20s cap was silently cutting that off before it could ever be
                 // used, every single run.
-                f.nest(withTimeout(privileged.listInstalledApps(), 60000, { packages: [] }));
+                f.nest(withTimeout(privileged.listInstalledApps(), 60000,
+                                   { packages: [], romApps: [] }));
             } else {
-                f.result = { packages: [] };
+                f.result = { packages: [], romApps: [] };
             }
         });
         future.then(this, function (f) {
             var result = f.result;
-            manifest.packages = (result && result.packages) || [];
+            // Only the user's own apps. Anything the system image provides -
+            // baked into /usr/palm/applications, or staged under
+            // /usr/palm/ipkgs as a preload it installs on first boot - comes
+            // back by reflashing, so it has no business in a user backup.
+            //
+            // ipkg cannot tell us that on its own. A preload leaves an ordinary
+            // cryptofs install behind, indistinguishable from a user's; and an
+            // image is free to seed a status stanza for an app it BAKED, which
+            // webOS CE 3.1 does for Preware, Govnah and the Synergy runtime so
+            // Preware shows them installed. Taking that list at face value both
+            // archived 13MB of preloaded apps the restoring device already has
+            // and tried to tar directories that are not in cryptofs at all.
+            var romApps = {};
+            ((result && result.romApps) || []).forEach(function (id) {
+                romApps[id] = true;
+            });
+            manifest.packages = (((result && result.packages) || [])
+                .filter(function (pkg) { return !romApps[pkg.id]; }));
             backup.incrementProgress(5);
 
             if (manifest.packages.length === 0 || !isPrivileged) {
@@ -797,15 +827,55 @@ function BackupAssistant() {
             // defeats the entire point at restore time: the manifest records
             // apps it could have put back automatically as needing a manual
             // reinstall.
-            f.nest(withTimeout(
-                privileged.archivePackages(manifest.packages, stageDir + "packages/"),
-                packageOpWrapperBudget(manifest.packages.length),
-                { archived: [], archivedDirs: [] }));
+            // ONE PACKAGE PER CALL, so the run can say what it is working on.
+            // Archiving is where a backup goes quiet: a 439MB game takes
+            // minutes during which the percentage cannot move, and a still bar
+            // with no explanation reads as a hang. Handing the helper the whole
+            // list meant the service was blind until the last one finished.
+            //
+            // The per-call budget is a flat generous value rather than
+            // packageOpBudget(1) - that is 120s, which would re-impose at this
+            // level exactly the limit just removed from the helper. The helper
+            // sizes its own tar timeout (~1.5s/MB, ceiling 20min) and always
+            // answers before it, so this only has to be comfortably larger.
+            var SINGLE_PACKAGE_BUDGET = 1260000;   // helper ceiling + 60s
+            f.nest(mapFuture(manifest.packages, function (pkg) {
+                // Just the name. $L lives in the app, not in this service -
+                // there is no localisation here, and composing the sentence
+                // service-side would hard-code English into the protocol.
+                backup.setStatusDetail(pkg.title || pkg.id);
+                var one = withTimeout(
+                    privileged.archivePackages([pkg], stageDir + "packages/",
+                                               SINGLE_PACKAGE_BUDGET),
+                    SINGLE_PACKAGE_BUDGET + 30000,
+                    { archived: [], archivedDirs: [], failures: [] });
+                one.then(this, function (of) {
+                    var r = of.exception ? {} : (of.result || {});
+                    archivedAll = archivedAll.concat(r.archived || []);
+                    archivedDirsAll = archivedDirsAll.concat(r.archivedDirs || []);
+                    failuresAll = failuresAll.concat(r.failures || []);
+                    of.result = {};
+                });
+                return one;
+            }));
+        });
+        future.then(this, function (f) {
+            var result = f.result;
+            backup.setStatusDetail(null);
+            f.result = { archived: archivedAll, archivedDirs: archivedDirsAll,
+                         failures: failuresAll };
         });
         future.then(this, function (f) {
             var result = f.result;
             var archivedIds = (result && result.archived) || [];
             var archivedDirIds = (result && result.archivedDirs) || [];
+            // Why an archive did not happen, straight from the helper. Without
+            // it a package that timed out is indistinguishable in the manifest
+            // from one that was never installed - both just lack a file - and
+            // "not captured" at restore time gives the user nothing to act on.
+            ((result && result.failures) || []).forEach(function (fl) {
+                archiveFailures[fl.id] = fl.reason;
+            });
             var archivedSet = {};
             archivedIds.forEach(function (id) { archivedSet[id] = true; });
             var archivedDirSet = {};
@@ -847,6 +917,9 @@ function BackupAssistant() {
                 if (pkg.dirBackedUp) {
                     pkg.dirFile = cleanFileDescriptor(byPath[pkg.id + "-app.tar.gz"]);
                 }
+                if (archiveFailures[pkg.id]) {
+                    pkg.archiveError = archiveFailures[pkg.id];
+                }
             });
             backup.incrementProgress(5);
             manifest.finished = dateUtil.formatDateRfc1123(new Date());
@@ -868,9 +941,21 @@ function BackupAssistant() {
             try {
                 logger.log("Backup complete:", manifestName, manifest.size, "bytes,",
                     skipped.length, "skipped");
+
+                // Read before setPassphrase(null), which clears it. Same reason
+                // restore carries this: a keystore that would not export leaves
+                // a backup that looks complete and has no passwords in it, and
+                // the user only finds out at restore time, on a different
+                // device, when it is far too late to do anything about it.
+                var credentialsError = credentials.getLastError();
+                if (credentialsError) {
+                    logger.warn("Saved passwords were not backed up:", credentialsError);
+                }
+                credentials.setPassphrase(null);
                 backup.setStatusComplete({
                     manifestName: manifestName,
                     size:         manifest.size,
+                    credentialsError: credentialsError || undefined,
                     skipped:      skipped.length
                 });
                 f.result = {
@@ -878,6 +963,7 @@ function BackupAssistant() {
                     STATUS:       "Complete",
                     manifestName: manifestName,
                     size:         manifest.size,
+                    credentialsError: credentialsError || undefined,
                     skipped:      skipped
                 };
             } finally {
@@ -898,9 +984,31 @@ function BackupAssistant() {
 
         // Best-effort cleanup; the failure we report is the original one.
         var cleanup = stageDir ? fileUtil.rmFiles(stageDir, true) : new Future({});
+
+        /*
+         * Sweep what this run already stored. A backup stores each file as it
+         * goes and writes the manifest LAST, so a run that dies partway has
+         * left files in the store that no manifest references -- and only the
+         * success path used to purge. Every failure therefore leaked, at full
+         * size, and the leak made the next run likelier to fail the same way.
+         *
+         * Measured on a daily driver (2026-08-29): two failed runs in one day
+         * left two unreferenced copies of a 295MB app archive; /media/internal
+         * hit 100% and backups then failed with ENOSPC on every attempt.
+         *
+         * keep = 100000 sweeps orphans WITHOUT trimming manifests: a failed
+         * backup must not also delete the user's older good backups. (Same
+         * call shape list-backups uses.) Tolerated -- a cleanup that fails
+         * must not replace the error we are actually reporting.
+         */
+        cleanup.then(this, function (f) {
+            var result = f.result;
+            f.nest(tolerate(backup.purge(target, 100000), null));
+        });
         cleanup.then(this, function (f) {
             var result = f.result;
 
+            credentials.setPassphrase(null);
             if (!backup.isCanceled()) {
                 backup.setStatusFailed(err.type, err.message);
             }
@@ -915,6 +1023,12 @@ function BackupAssistant() {
         var full = args.full === true;
 
         logger.log("startBackup, type=" + (full ? "full" : "incremental"));
+
+        // Held for this run only, and never logged - see util/credentials.js.
+        // A run started without one (the scheduled daily backup, which has
+        // nobody to ask) simply skips the passwords category and says so in
+        // the manifest.
+        credentials.setPassphrase(args.passphrase);
 
         if (backup.isRunning()) {
             logger.log("A backup is already running");
