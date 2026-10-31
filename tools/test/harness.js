@@ -297,11 +297,17 @@ function loadService(options) {
     // literals created inside the context kept the context's own — so
     // shellQuote would be missing exactly where it is used.
     var sandbox = {
-        console: options.quiet ? { log: function () {} } : console,
-        require: require,
+        // options.console captures what the service logs (the redaction
+        // tests in restore-hardening.js read it back).
+        console: options.console || (options.quiet ? { log: function () {} } : console),
+        // options.require lets a test stand in a different node vintage's
+        // fs/path — see the pathExists section in run-tests.js.
+        require: options.require || require,
         setTimeout: setTimeout,
         clearTimeout: clearTimeout,
-        Buffer: Buffer,
+        // options.Buffer stands in an older node's Buffer (one with no .alloc)
+        // for the allocBuffer section in run-tests.js.
+        Buffer: options.Buffer || Buffer,
         process: process,
 
         IMPORTS: {
@@ -312,7 +318,7 @@ function loadService(options) {
             },
             "foundations.io": {},
             "foundations.json": {},
-            require: require
+            require: options.require || require
         }
     };
     sandbox.global = sandbox;

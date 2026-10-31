@@ -7,16 +7,19 @@
  * the file-cache temp dir is how services hand us their data and the
  * connection check is what a Synergy target will need later.
  */
-/*global Future, PalmCall, logger, isEmpty, require, fileUtil, privileged, tolerate, WORK_ROOT */
+/*global allocBuffer, Future, PalmCall, logger, isEmpty, platform, require, fileUtil,
+  privileged, tolerate, WORK_ROOT, redactSecrets, redactText */
 
 var system = (function () {
     var that = {};
 
-    var SYSTEM_SERVICE_URL     = "palm://com.palm.systemservice";
-    var CONNECTION_MANAGER_URL = "palm://com.palm.connectionmanager";
-    var POWER_SERVICE_URL      = "palm://com.palm.power";
-    var ACTIVITY_MANAGER_URL   = "palm://com.palm.activitymanager";
-    var FILE_CACHE_ID          = "com.palm.filecache";
+    // Resolved per platform - these were renamed on the OSE bus and nothing
+    // aliases the old names. See util/platform.js.
+    var SYSTEM_SERVICE_URL     = platform.url("systemservice");
+    var CONNECTION_MANAGER_URL = platform.url("connectionmanager");
+    var POWER_SERVICE_URL      = platform.url("power");
+    var ACTIVITY_MANAGER_URL   = platform.url("activitymanager");
+    var FILE_CACHE_ID          = platform.service("filecache");
 
     // The stock backup service's file cache type, registered on every webOS
     // 3.0.5 device by /etc/palm/filecache_types/backuptempdir. Reused rather
@@ -75,7 +78,9 @@ var system = (function () {
         var fullUrl = url + "/" + cmd;
         args = args !== undefined ? args : {};
 
-        logger.log("Calling", fullUrl, "with", args);
+        // Redacted here and not only in the logger: args can carry the
+        // backup passphrase and keystore (credentials.js).
+        logger.log("Calling", fullUrl, "with", redactSecrets(args));
         var future = safeCall(url, cmd, args);
         future.then(this, function (f) {
             var err;
@@ -88,7 +93,17 @@ var system = (function () {
             }
 
             if (!isUnreachable(err)) {
-                logger.error("Call to", fullUrl, "failed:", err.message || err);
+                // PalmCall's message interpolates the call's arguments, so a
+                // failed keymanager call would carry the passphrase onward -
+                // into this log, the restore status and the manifest. Scrub
+                // the error itself, not just this line.
+                var scrubbed = redactText(err.message || err);
+                try {
+                    err.message = scrubbed;
+                } catch (readOnly) {
+                    err = new Error(scrubbed);
+                }
+                logger.error("Call to", fullUrl, "failed:", scrubbed);
                 err.serviceId = serviceId;
                 throw err;
             }
@@ -114,7 +129,13 @@ var system = (function () {
     };
 
     that.getDeviceProfile = function () {
-        var future = that.palmcall("com.palm.deviceprofile", "getDeviceProfile", {});
+        var profileService = platform.service("deviceprofile");
+        if (profileService === null) {
+            // No counterpart on the OSE bus. Callers all tolerate an empty
+            // profile; failing fast beats a guaranteed round trip to nothing.
+            return failedFuture(new Error("com.palm.deviceprofile does not exist on this platform"));
+        }
+        var future = that.palmcall(profileService, "getDeviceProfile", {});
         future.then(this, function (f) {
             var result = f.result;
             var deviceInfo = result.deviceInfo || {};
@@ -133,6 +154,48 @@ var system = (function () {
      * so a public-bus caller cannot launch it and gets "Service does not
      * exist". Reading the node is both simpler and more reliable.
      */
+    /**
+     * `nyx-cmd DeviceInfo query nduid`, or null when nyx-cmd is absent or the
+     * query is not implemented on this device. Returns a Future when it runs at
+     * all, so getNduId can hand it straight back.
+     *
+     * Not every DeviceInfo query is implemented per platform - serial_number
+     * answers "Error: Query not implemented" on a mindphone while nduid answers
+     * fine - so the output is validated rather than trusted.
+     */
+    var nduIdFromNyx = function () {
+        var exec = require('child_process').exec;
+        var future = new Future();
+
+        exec("nyx-cmd DeviceInfo query nduid", { timeout: 10000 },
+            function (error, stdout) {
+                if (error) {
+                    logger.log("nyx-cmd nduid failed:", error.message);
+                    future.result = null;
+                    return;
+                }
+                var value = String(stdout).replace(/[^0-9a-zA-Z]/g, "");
+                // "Error: Query not implemented" survives that filter as text,
+                // so require it to look like an identifier and not like prose.
+                if (!value || /^Error/i.test(String(stdout))) {
+                    future.result = null;
+                    return;
+                }
+                future.result = value;
+            });
+
+        var wrapped = new Future();
+        future.then(this, function (f) {
+            var result = f.result;
+            if (result) {
+                logger.log("nduId from nyx:", result);
+            }
+            f.result = result;
+        });
+        wrapped.nest(future);
+        return wrapped;
+    };
+
     that.getNduId = function () {
         var fs = require('fs');
         var nduId = null;
@@ -143,7 +206,7 @@ var system = (function () {
         // hands back an empty string without ever reading anything.
         try {
             fd = fs.openSync("/dev/nduid", "r");
-            var buffer = new Buffer(128);
+            var buffer = allocBuffer(128);
             var read = fs.readSync(fd, buffer, 0, 128, null);
             if (read > 0) {
                 nduId = buffer.toString("utf8", 0, read).replace(/[^0-9a-zA-Z]/g, "");
@@ -160,19 +223,41 @@ var system = (function () {
             return new Future(nduId);
         }
 
-        // Fall back to the device profile, for a device that does not expose
-        // the node. Kept synchronous on purpose: the previous version chained
-        // this inside an fs callback, where `this` is not the system object.
-        // Foundations asserts its scope is an object, so it threw — and a throw
-        // inside an fs callback is outside any future's reach, which took the
-        // whole service process down without logging anything.
-        logger.warn("No nduId from /dev/nduid, asking the device profile");
-        var profile = tolerate(that.getDeviceProfile(), {});
-        profile.then(this, function (f) {
-            var result = f.result;
-            f.result = (result && result.nduId) || null;
+        // No /dev/nduid. On the OSE bus there is no such node and no
+        // com.palm.deviceprofile either, but nyx knows the same identifier -
+        // `nyx-cmd DeviceInfo query nduid` returns the device's nduid, distinct
+        // per device and stable across reboots. Without this the manifest is
+        // named "000001-Unknown" on every LuneOS device, which matters: the
+        // manifest directory is <seq>-<nduId> and restoring another device's
+        // backup keys off it.
+        // Then nyx, then the device profile. Chained rather than tested for
+        // truthiness: nduIdFromNyx returns a Future, and a Future is always
+        // truthy, so `if (nyx) return nyx` would swallow the profile fallback
+        // on every device without nyx-cmd.
+        //
+        // The profile step stays as it was. Kept out of an fs callback on
+        // purpose: `this` is not the system object in there, Foundations
+        // asserts its scope is an object, so it threw - and a throw inside an
+        // fs callback is outside any future's reach, which took the whole
+        // service process down without logging anything.
+        logger.warn("No nduId from /dev/nduid, asking nyx");
+
+        var future = nduIdFromNyx();
+        future.then(this, function (f) {
+            var fromNyx = f.exception ? null : f.result;
+            if (fromNyx) {
+                f.result = fromNyx;
+                return;
+            }
+            logger.warn("No nduId from nyx either, asking the device profile");
+            var profile = tolerate(that.getDeviceProfile(), {});
+            profile.then(this, function (pf) {
+                var result = pf.result;
+                pf.result = (result && result.nduId) || null;
+            });
+            f.nest(profile);
         });
-        return profile;
+        return future;
     };
 
     that.getDeviceName = function () {
@@ -329,11 +414,16 @@ var system = (function () {
         return i > -1 ? ret.substr(0, i) : ret;
     };
 
+    // The battery floor of the stock ScheduledBackup activity.
+    that.SCHEDULED_MIN_BATTERY = 25;
+
     /**
-     * Creates (or replaces) the daily backup activity. Mirrors the stock
+     * The daily backup activity. Mirrors the stock
      * com.palm.service.backup.scheduled activity, under our own name.
+     * `requirements` and the callback params differ by platform; see
+     * createScheduledActivity.
      */
-    that.createScheduledActivity = function () {
+    var scheduledActivity = function (requirements, params) {
         var activity = {
             name: "com.palm.app.backup.service.scheduled",
             description: "Daily woce-backup",
@@ -347,9 +437,6 @@ var system = (function () {
                 persist: true,
                 power: true
             },
-            requirements: {
-                battery: 25
-            },
             // interval only. Adding a start time gets "Unless precise time is
             // specified, time intervals may not specify a start or end time" —
             // the stock ScheduledBackup activity carried the same bare interval.
@@ -358,15 +445,67 @@ var system = (function () {
             },
             callback: {
                 method: "palm://com.palm.app.backup.service/scheduledBackup",
-                params: { scheduled: true }
+                params: params
             }
         };
-
-        return that.palmcall("com.palm.activitymanager", "create", {
+        if (requirements) {
+            activity.requirements = requirements;
+        }
+        return {
             activity: activity,
             start: true,
             replace: true
+        };
+    };
+
+    /**
+     * Creates (or replaces) the daily backup activity.
+     *
+     * Legacy webOS gets the stock spec, whose Activity Manager holds the run
+     * until the battery is at SCHEDULED_MIN_BATTERY percent. LuneOS's Activity
+     * Manager has no battery requirement - only bootup, internet and wifi, each
+     * taking only `true` - and refuses the stock spec outright ("If 'battery'
+     * requirement is specified, the only legal value is 'true'"), which left
+     * the daily backup unscheduled. There it gets our own spec instead: no
+     * requirement, and checkBattery in the callback params so the scheduled
+     * run applies the floor itself (scheduledBackupAllowed).
+     */
+    that.createScheduledActivity = function () {
+        var spec = platform.isModernBus()
+            ? scheduledActivity(null, { scheduled: true, checkBattery: true })
+            : scheduledActivity({ battery: that.SCHEDULED_MIN_BATTERY }, { scheduled: true });
+        return that.palmcall(platform.service("activitymanager"), "create", spec);
+    };
+
+    /**
+     * Whether a scheduled backup may run now: on charger power, or with the
+     * battery at SCHEDULED_MIN_BATTERY percent or more - what the legacy
+     * Activity Manager enforces through the activity's battery requirement.
+     * A reading that cannot be had does not hold the backup up.
+     */
+    that.scheduledBackupAllowed = function () {
+        var future = safeCall(POWER_SERVICE_URL, "com/palm/power/batteryStatusQuery", {});
+        future.then(this, function (f) {
+            var level = null;
+            if (!f.exception) {
+                var result = f.result;
+                level = result.percent_ui !== undefined ? result.percent_ui : result.percent;
+            }
+            if (typeof level !== "number" || level >= that.SCHEDULED_MIN_BATTERY) {
+                f.result = true;
+                return;
+            }
+            f.nest(safeCall(POWER_SERVICE_URL, "com/palm/power/chargerStatusQuery", {}));
         });
+        future.then(this, function (f) {
+            if (f.exception) {
+                f.result = false;
+                return;
+            }
+            var result = f.result;
+            f.result = result === true || result.connected === true;
+        });
+        return future;
     };
 
     /**
@@ -374,7 +513,7 @@ var system = (function () {
      * opting out twice must not fail.
      */
     that.cancelScheduledActivity = function () {
-        var future = that.palmcall("com.palm.activitymanager", "cancel", {
+        var future = that.palmcall(platform.service("activitymanager"), "cancel", {
             activityName: "com.palm.app.backup.service.scheduled"
         });
         future.then(this, function (f) {

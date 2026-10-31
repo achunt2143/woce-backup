@@ -21,7 +21,7 @@
 /*global Future, FILES_PATH, MANIFEST_ROOT, PalmCall, packageOpWrapperBudget,
   serviceCallTimeout, STAGE_ROOT, backup, dateUtil, fileUtil, getParent, isEmpty,
   logger, mapFuture, prefs, privileged, require, system, targets, tolerate,
-  userData, withDeadline, withTimeout */
+  credentials, userData, withDeadline, withTimeout, restorePolicy */
 
 // A fresh RestoreAssistant is constructed per call, so this has to live
 // outside it to be visible to the next one. Set for the duration of a
@@ -54,12 +54,68 @@ function RestoreAssistant() {
 
     /**
      * True if this path lives outside the jail and therefore needs the helper.
+     * Only ever asked about a path restorePolicy has already accepted, so it
+     * is normalised and has no '..' left to defeat the prefix test.
      */
     var needsHelper = function (path) {
         if (path.charAt(0) !== "/") {
             return false;   // relative: resolved inside the temp dir
         }
+        // Unjailed and root (LuneOS): every absolute destination goes through
+        // privileged.unstage, which re-checks it after creating parents and
+        // opens it O_NOFOLLOW. Writing it here instead would follow a symlink
+        // planted at the destination over USB after restorePolicy looked.
+        if (privileged.isDirect()) {
+            return true;
+        }
         return !isWritableHere(path);
+    };
+
+    /**
+     * Why a manifest file entry may not be restored, or null if it may.
+     *
+     * The manifest is untrusted (see util/restore-policy.js): its path is the
+     * write destination, and its checksum is a path component on the read and
+     * the staging side. Either one being off is enough to drop the entry.
+     */
+    var refuseFile = function (file, tempDir) {
+        if (!file || typeof file !== "object") {
+            return { reason: "not a file entry" };
+        }
+        var checked = restorePolicy.checkFilePath(file.path, tempDir);
+        if (!checked.path) {
+            return checked;
+        }
+        if (!restorePolicy.isValidStoredName(backup.getServerFilename(file))) {
+            return { reason: "bad stored-file name" };
+        }
+        return null;
+    };
+
+    /**
+     * The service's file entries that pass refuseFile, each carrying the
+     * destination it was checked against. Refusals are logged and reported as
+     * skipped; nothing downstream ever sees them - not the fetch, not the
+     * write, and not the service's own postRestore.
+     */
+    var acceptFiles = function (serviceId, files, tempDir) {
+        var accepted = [];
+        (files || []).forEach(function (file) {
+            var refused = refuseFile(file, tempDir);
+            var shown = String(file && file.path).substring(0, 256);
+            if (refused) {
+                logger.warn("Refusing to restore", JSON.stringify(shown), "for",
+                    serviceId + ":", refused.reason);
+                skipped.push({ service: serviceId, path: shown,
+                    reason: "refused: " + refused.reason });
+                return;
+            }
+            accepted.push({
+                file: file,
+                destination: restorePolicy.checkFilePath(file.path, tempDir).path
+            });
+        });
+        return accepted;
     };
 
     /**
@@ -85,14 +141,17 @@ function RestoreAssistant() {
      * destination. Files bound outside it land in the staging area first and
      * are handed to the helper afterwards, in one batch per service.
      */
-    var restoreFile = function (file, tempDir, toUnstage) {
-        if (system.isReadOnlyPartition(file.path)) {
+    var restoreFile = function (entry, tempDir, toUnstage) {
+        var file = entry.file;
+        var destination = entry.destination;
+        if (system.isReadOnlyPartition(destination)) {
             return new Future({});
         }
 
         var storedName = backup.getServerFilename(file);
-        var destination = fileUtil.getAbsolutePath(file.path, tempDir);
-        var viaHelper = needsHelper(file.path);
+        // Asked of the manifest's own spelling: a relative name was resolved
+        // into the temp dir, which is ours to write whatever the platform.
+        var viaHelper = needsHelper(String(file.path).charAt(0) === "/" ? destination : file.path);
 
         if (viaHelper && !isPrivileged) {
             skipped.push({ path: file.path, reason: "not-privileged" });
@@ -134,16 +193,16 @@ function RestoreAssistant() {
             }
             var result = f.result;
             if (viaHelper) {
-                toUnstage.push({ staged: stagedName, path: file.path });
+                toUnstage.push({ staged: stagedName, path: destination });
             }
             f.result = {};
         });
         return future;
     };
 
-    var restoreFiles = function (files, tempDir, toUnstage) {
-        return mapFuture(files, function (file) {
-            return restoreFile(file, tempDir, toUnstage);
+    var restoreFiles = function (entries, tempDir, toUnstage) {
+        return mapFuture(entries, function (entry) {
+            return restoreFile(entry, tempDir, toUnstage);
         });
     };
 
@@ -155,6 +214,14 @@ function RestoreAssistant() {
      * in device/woce-backupd.js).
      */
     var fetchArchivedFile = function (id, fileDescriptor, packagesDir, extension) {
+        // Both checked before either becomes a path: doRestore has already
+        // dropped packages with a bad id, this is the last line for the
+        // stored name.
+        if (!restorePolicy.isValidPackageId(id) || !fileDescriptor ||
+                !restorePolicy.isValidStoredName(backup.getServerFilename(fileDescriptor))) {
+            logger.warn("Refusing to fetch an archived package with a bad id or file name");
+            return new Future({});
+        }
         var landing = packagesDir + id + extension;
         var fetchTo = fileDescriptor.compressed ? (landing + ".gz") : landing;
 
@@ -279,9 +346,17 @@ function RestoreAssistant() {
             var restoreFuture = privileged.restoreAppDirectories(toRestore);
             restoreFuture.then(this, function (rf) {
                 var restoreResult = rf.exception ? { restored: [], failed: toRestore.map(function (e) { return e.id; }) } : rf.result;
+                // An app put back this way had its service registered by hand
+                // (the installer never ran), and that registration only takes
+                // effect at the next boot - so the app works and its service
+                // does not, until then. Carried up through the result rather
+                // than written into doRestore's scope: this function is a
+                // sibling of doRestore, not nested inside it.
                 rf.result = {
                     installed: restoreResult.restored || [],
-                    failed: fetchFailed.concat(restoreResult.failed || [])
+                    failed: fetchFailed.concat(restoreResult.failed || []),
+                    failureReasons: restoreResult.failureReasons || {},
+                    servicesRegistered: restoreResult.servicesRegistered || []
                 };
             });
             f.nest(restoreFuture);
@@ -310,6 +385,9 @@ function RestoreAssistant() {
             if (serviceName === userData.SERVICE_ID) {
                 return userData[method](params);
             }
+            if (serviceName === credentials.SERVICE_ID) {
+                return credentials[method](params);
+            }
             throw new Error("No in-process provider for " + serviceName);
         }
         // Bounded. com.palm.browserServer accepted preBackup and never
@@ -326,15 +404,25 @@ function RestoreAssistant() {
         var serviceId = service.service;
         var toUnstage = [];
         var proceed = true;
+        var accepted = acceptFiles(serviceId, service.files, tempDir);
 
-        logger.log("Restoring", serviceId, "-", (service.files || []).length, "file(s)");
+        logger.log("Restoring", serviceId, "-", accepted.length, "file(s)");
 
         var future = fileUtil.rmFiles(tempDir);
         future.then(this, function (f) {
             var result = f.result;
             if (descriptor.preRestore) {
+                // version as a string. com.palm.db's preBackup *returns* it as
+                // a number (8), but its preRestore schema declares
+                // {"version": {"type": "string"}} with additionalProperties
+                // false, so echoing back what it gave us is rejected:
+                //   invalid type for property 'version'
+                // Measured against db8 3.2.0 once the admin patch made these
+                // methods reachable at all. Stringifying is safe for every
+                // other service: the value only has to round-trip, and a
+                // service that returned a string gets its string back.
                 f.nest(callCallback(serviceId, descriptor.preRestore,
-                    { version: service.version }, descriptor));
+                    { version: String(service.version) }, descriptor));
             } else {
                 f.result = { proceed: true };
             }
@@ -349,7 +437,7 @@ function RestoreAssistant() {
                     service.version + ")");
                 f.result = false;
             } else {
-                f.nest(restoreFiles(service.files || [], tempDir, toUnstage));
+                f.nest(restoreFiles(accepted, tempDir, toUnstage));
             }
         });
         future.then(this, function (f) {
@@ -377,13 +465,21 @@ function RestoreAssistant() {
                 f.result = false;
                 return;
             }
-            var filenames = (service.files || []).map(function (file) {
-                return file.path;
+            // Only what was accepted: a refused name must not reach the
+            // service either, since db8 and systemservice join it onto
+            // tempDir themselves.
+            var filenames = accepted.map(function (entry) {
+                return entry.file.path;
             });
+            // No version here. The protocol's postRestore is
+            // postRestore(files, tempDir), and com.palm.db enforces exactly
+            // that - its schema is additionalProperties:false over tempDir and
+            // files, so passing version fails the whole call with
+            //   property not allowed - 'version'
+            // which on a real restore means db8's data never lands.
             f.nest(callCallback(serviceId, descriptor.postRestore, {
                 files:   filenames,
-                tempDir: tempDir,
-                version: service.version
+                tempDir: tempDir
             }, descriptor));
         });
         future.then(this, function (f) {
@@ -479,6 +575,22 @@ function RestoreAssistant() {
         var failedPackages = [];
         var restorableCandidates = [];   // manifest.packages, minus system apps and anything already installed
         var packageOpTimedOut = false;   // a package op is still running out there
+        // Why each package was left out, kept apart rather than merged: the
+        // receipt below has to be able to say "you already have it" and "the
+        // image provides it" separately, because they mean different things to
+        // someone asking why an app did not come back.
+        var presentIds = {};             // ipkg already has it on THIS device
+        var imageIds = {};               // baked or preloaded by the system image
+        var receipt = null;              // built at the end, written to the target
+        var serviceRegisteredIds = {};   // put back by directory fallback AND had a service
+        var restoreFailureReasons = {};  // id -> why the directory restore failed
+        // Whether apps come back at all. Reinstalling one runs its opkg
+        // maintainer scripts, or unpacks its tree into /media/cryptofs/apps,
+        // as root, from a backup nothing authenticates - so it is the
+        // restoreUserApps setting (default off) or an explicit per-call
+        // restoreUserApps:true from the caller, never just "the manifest
+        // listed some".
+        var restoreApps = args && args.restoreUserApps === true;
 
         skipped = [];
 
@@ -496,6 +608,12 @@ function RestoreAssistant() {
         future.then(this, function (f) {
             isPrivileged = f.result === true;
             logger.log("Restore, privileged mode:", isPrivileged);
+            f.nest(tolerate(prefs.get(), {}));
+        });
+        future.then(this, function (f) {
+            var preferences = f.result || {};
+            restoreApps = restoreApps || preferences.restoreUserApps === true;
+            logger.log("Restore, reinstalling apps:", restoreApps);
             f.nest(targets.getCurrent());
         });
         future.then(this, function (f) {
@@ -526,7 +644,7 @@ function RestoreAssistant() {
         });
         future.then(this, function (f) {
             tempDir = f.result;
-            f.nest(backup.loadRegisteredServices());
+            f.nest(backup.loadRegisteredServices({ allProviders: true }));
         });
         future.then(this, function (f) {
             services = f.result;
@@ -562,13 +680,24 @@ function RestoreAssistant() {
             var result = f.result;
             progress(85);
 
-            // com.palm.*-prefixed packages are Palm/system-owned by
-            // convention on this platform (the same rule that decides
-            // private-bus outbound access, per CLAUDE.md) - even when
-            // third-party-distributed, like the community App Catalog build,
-            // they come back via the OS/OTA process, not this app's restore.
-            restorableCandidates = (manifest.packages || []).filter(function (pkg) {
-                return pkg.id.indexOf("com.palm.") !== 0;
+            // Everything in the manifest is a candidate at this point. What
+            // the *restoring* device already provides is subtracted below,
+            // once the helper has been asked - which is the only place that
+            // question can be answered, since it is about this device and not
+            // the one the backup came from.
+            var listed = Object.prototype.toString.call(manifest.packages) === "[object Array]"
+                ? manifest.packages : [];
+            // A package id becomes a file name in the staging directory and
+            // an argument to opkg and tar; one that is not a plain id is
+            // dropped here, before any of that.
+            restorableCandidates = listed.filter(function (pkg) {
+                if (pkg && restorePolicy.isValidPackageId(pkg.id)) {
+                    return true;
+                }
+                var shown = String(pkg && pkg.id).substring(0, 128);
+                logger.warn("Refusing a package with a bad id:", JSON.stringify(shown));
+                skipped.push({ path: shown, reason: "refused: bad package id" });
+                return false;
             });
 
             if (restorableCandidates.length === 0 || !isPrivileged) {
@@ -582,26 +711,49 @@ function RestoreAssistant() {
             // The helper's own budget for this job is 60s (ipkg enumeration is
             // genuinely slow here); plain tolerate() would have capped it at
             // 20s, the same trap already fixed on the backup side.
-            f.nest(withTimeout(privileged.listInstalledApps(), 60000, { packages: [] }));
+            f.nest(withTimeout(privileged.listInstalledApps(), 60000,
+                               { packages: [], romApps: [] }));
         });
         future.then(this, function (f) {
             var result = f.result;
             var alreadyInstalled = {};
             (result.packages || []).forEach(function (pkg) {
                 alreadyInstalled[pkg.id] = true;
+                presentIds[pkg.id] = true;
+            });
+            // Anything the system image provides - baked into the rootfs, or
+            // staged as a preload it installs on first boot - is already here
+            // even when ipkg has no record of it, and comes back by reflashing
+            // rather than from a backup. Putting a backed-up copy into cryptofs
+            // on top of one does not restore it, it SHADOWS the image's own
+            // copy with an older one.
+            //
+            // This is the whole webOS 3.0.5 -> CE 3.1 upgrade path: CE bakes
+            // and preloads apps a 3.0.5 device carried as ordinary cryptofs
+            // installs, so a backup taken before the upgrade names them all.
+            // It replaces a com.palm.* name check that got this wrong both
+            // ways - see listImageApps in device/woce-backupd.js.
+            (result.romApps || []).forEach(function (id) {
+                alreadyInstalled[id] = true;
+                imageIds[id] = true;
             });
             restorableCandidates = restorableCandidates.filter(function (pkg) {
                 return !alreadyInstalled[pkg.id];
             });
 
             progress(88);
+            if (!restoreApps && restorableCandidates.length > 0) {
+                logger.log("Not reinstalling", restorableCandidates.length,
+                    "app(s): restoreUserApps is off");
+            }
             // Not tolerate(): its generic 20s covered fetching every .ipk out
             // of the target *and* running ipkg on each, against a helper job
             // that budgets 60s per package. On any real restore the wrapper won
             // and reported every application as needing a manual reinstall
             // while ipkg was still installing them.
             f.nest(withTimeout(
-                installArchivedPackages(restorableCandidates, stageDir + "packages/"),
+                installArchivedPackages(restoreApps ? restorableCandidates : [],
+                    stageDir + "packages/"),
                 packageOpWrapperBudget(restorableCandidates.length),
                 { installed: [], failed: [], timedOut: true }));
         });
@@ -617,7 +769,8 @@ function RestoreAssistant() {
             // candidates is a mixed list, and each of these two functions
             // filters to only the packages relevant to it.
             f.nest(withTimeout(
-                installArchivedAppDirectories(restorableCandidates, stageDir + "packages/"),
+                installArchivedAppDirectories(restoreApps ? restorableCandidates : [],
+                    stageDir + "packages/"),
                 packageOpWrapperBudget(restorableCandidates.length),
                 { installed: [], failed: [], timedOut: true }));
         });
@@ -625,6 +778,19 @@ function RestoreAssistant() {
             var result = f.result;
             installedPackages = installedPackages.concat(result.installed || []);
             failedPackages = failedPackages.concat(result.failed || []);
+            (result.servicesRegistered || []).forEach(function (id) {
+                serviceRegisteredIds[id] = true;
+            });
+            // Same carry as serviceRegisteredIds above, and for the same
+            // reason: written here, in doRestore's own chain, because the
+            // function that produced it is a sibling and cannot reach this
+            // scope. withTimeout's fallback result has no reasons at all.
+            var reasons = result.failureReasons || {};
+            for (var failedId in reasons) {
+                if (reasons.hasOwnProperty(failedId)) {
+                    restoreFailureReasons[failedId] = reasons[failedId];
+                }
+            }
             packageOpTimedOut = packageOpTimedOut || (result.timedOut === true);
             progress(92);
 
@@ -669,6 +835,101 @@ function RestoreAssistant() {
             var result = f.result;
             manifest.restoredCount = (manifest.restoredCount || 0) + 1;
             manifest.lastRestored = dateUtil.formatDateRfc1123(new Date());
+
+            /* A durable receipt of what this restore actually did.
+             *
+             * The per-package outcome used to exist only in the reply to the
+             * subscribing app: shown once, then gone. After a migration the one
+             * question people ask is "what did NOT come back, and why", and
+             * nothing on disk could answer it - not the manifest (it records
+             * what was backed up, not what was put back), not the helper log
+             * (a tally of successes). Worse, the two most common answers are
+             * invisible by construction, because a package skipped as already
+             * present or as image-provided is filtered out long before the
+             * result is built.
+             *
+             * Written through the target, not to a fixed path, so it travels
+             * with the backup like the manifest does; under receipts/ rather
+             * than manifests/ so listLocalManifests never sees it (its regex
+             * would reject it anyway, but a manifest directory holding
+             * non-manifests is a trap for the next reader).
+             */
+            var installedSetR = {};
+            installedPackages.forEach(function (id) { installedSetR[id] = true; });
+            var failedSetR = {};
+            failedPackages.forEach(function (id) { failedSetR[id] = true; });
+
+            var counts = {
+                installed: 0, failed: 0, notCaptured: 0,
+                alreadyPresent: 0, imageProvided: 0, notRequested: 0
+            };
+            var receiptPackages = (Object.prototype.toString.call(manifest.packages) === "[object Array]"
+                ? manifest.packages : []).filter(function (pkg) {
+                return pkg && typeof pkg === "object";
+            }).map(function (pkg) {
+                var outcome;
+                if (imageIds[pkg.id]) {
+                    outcome = "image-provided";     // reflashing brings it back
+                } else if (presentIds[pkg.id]) {
+                    outcome = "already-present";    // never uninstalled here
+                } else if (installedSetR[pkg.id]) {
+                    outcome = "installed";
+                } else if (!restoreApps || !restorePolicy.isValidPackageId(pkg.id)) {
+                    outcome = "not-requested";      // app restore off, or refused
+                } else if (!pkg.archived && !pkg.dirBackedUp) {
+                    outcome = "not-captured";       // the backup never held it
+                } else {
+                    outcome = "failed";             // had it, could not put it back
+                }
+                counts[{
+                    "installed": "installed",
+                    "failed": "failed",
+                    "not-captured": "notCaptured",
+                    "already-present": "alreadyPresent",
+                    "image-provided": "imageProvided",
+                    "not-requested": "notRequested"
+                }[outcome]] += 1;
+                var entry = {
+                    id: pkg.id,
+                    title: pkg.title,
+                    version: pkg.version,
+                    outcome: outcome
+                };
+                if (outcome === "failed" && restoreFailureReasons[pkg.id]) {
+                    // "failed" on its own sent a whole release cycle looking
+                    // for a corrupt archive when the real answer was a budget
+                    // that ran out. Put the reason where the user reads it.
+                    entry.note = restoreFailureReasons[pkg.id];
+                }
+                if (outcome === "not-captured" && pkg.archiveError) {
+                    // Carry the backup-time reason forward: "not captured" on
+                    // its own does not tell you whether the app was never
+                    // there or was too big to archive in the time allowed.
+                    entry.note = pkg.archiveError;
+                }
+                if (serviceRegisteredIds[pkg.id]) {
+                    // Registered by us, not by ipkg: live only after the reboot.
+                    entry.serviceRegistered = true;
+                    entry.note = "service registered by restore; needs the reboot to start";
+                }
+                return entry;
+            });
+
+            receipt = {
+                manifestName: manifestName,
+                restoredAt:   manifest.lastRestored,
+                restoreCount: manifest.restoredCount,
+                backedUpFrom: manifest.deviceInfo,
+                backedUpOs:   manifest.osVersion,
+                // Whether saved passwords were in the backup, and when they
+                // were carried from an earlier one, which and as of when.
+                credentials:  backup.describeCredentials(manifest),
+                summary:      counts,
+                skipped:      skipped,
+                packages:     receiptPackages
+            };
+            counts.servicesRegistered = Object.keys(serviceRegisteredIds).length;
+            logger.log("Restore receipt:", JSON.stringify(counts));
             // Lives on the manifest, not in this device's own prefs: the
             // point is "has this backup been restored", which travels with
             // it the same way the manifest itself does, not just "restored
@@ -676,6 +937,13 @@ function RestoreAssistant() {
             // above - the restore already succeeded, and a failed write-back
             // here must not turn that into a reported failure.
             f.nest(tolerate(backup.storeManifest(target, manifest, manifestName), null));
+        });
+        future.then(this, function (f) {
+            var result = f.result;
+            // Best-effort, like the manifest write-back above: a restore that
+            // worked must not be reported as failed because a report about it
+            // could not be written.
+            f.nest(tolerate(backup.storeRestoreReceipt(target, receipt, manifestName), null));
         });
         future.then(this, function (f) {
             var result = f.result;
@@ -705,12 +973,25 @@ function RestoreAssistant() {
                     };
                 });
 
+                // A wrong passphrase does not fail the restore - everything
+                // else still lands - but it is the one failure the user can do
+                // something about, so it has to travel with the result rather
+                // than only into the log.
+                var credentialsError = credentials.getLastError();
+                if (credentialsError) {
+                    logger.warn("Saved passwords were not restored:", credentialsError);
+                }
+
                 var status = {
                     returnValue:  true,
                     STATUS:       "Complete",
                     manifestName: manifestName,
+                    credentialsError: credentialsError || undefined,
                     skipped:      skipped,
                     packages:     packagesResult,
+                    // false when apps were deliberately not reinstalled, so
+                    // the app can say why rather than call it a failure.
+                    appsRestored: restoreApps,
                     // Lets the UI offer an automatic restart: only the
                     // privileged helper can actually issue one (see
                     // handlers/reboot.js), so a limited-mode restore still
@@ -720,6 +1001,9 @@ function RestoreAssistant() {
                 publish(status);
                 f.result = status;
             } finally {
+                // Whether the restore succeeded or threw, the passphrase has
+                // done its job and must not outlive the run.
+                credentials.setPassphrase(null);
                 if (tempDirFuture) {
                     PalmCall.cancel(tempDirFuture);
                 }
@@ -731,7 +1015,11 @@ function RestoreAssistant() {
 
     this.run = function (future, subscription) {
         var args = this.controller.args;
-        logger.log("restore", args);
+        // Not logger.log("restore", args): args now carries the backup
+        // passphrase, and a service log is the last place it should turn up.
+        logger.log("restore", args && args.manifestName, "device", args && args.deviceId);
+
+        credentials.setPassphrase(args.passphrase);
 
         // Confirmed on-device: a second restore call issued ~7s after the
         // first - well past the point where the first's own progress ticks
