@@ -10,7 +10,7 @@
  * .enc and getFinalPath has no encrypted branch — see util/file-util.js for
  * why.
  */
-/*global DB, Future, FILES_PATH, MANIFESTS_PATH, RECEIPTS_PATH, MANIFEST_ROOT, fileUtil,
+/*global credentials, DB, Future, FILES_PATH, MANIFESTS_PATH, RECEIPTS_PATH, MANIFEST_ROOT, fileUtil,
   logger, mapFuture, privileged, removeAll, require, system, userData, isEmptyObject,
   STATIC_SERVICES_ROOT,
   zeroPad, dateUtil */
@@ -325,6 +325,46 @@ var backup = (function () {
     };
 
     /**
+     * Make sure the dynamic-service kind exists.
+     *
+     * It used to be created only when something actually called register(),
+     * which meant loadDynamicServices() logged
+     *
+     *     com.palm.db/find {"query":{"from":"com.palm.backup.dynamicservice:1"}}:
+     *     kind not registered: 'com.palm.backup.dynamicservice:1'
+     *
+     * on every backup and every restore of every device where nothing had ever
+     * registered - which is all of them. Harmless, and tolerated below, but it
+     * reads like a fault and buries the errors that are real.
+     *
+     * Straight to putKind, no existence check first: putKind is idempotent, and
+     * the obvious probe - find on Kind:1 - is not readable by a third-party
+     * caller ("permission denied for caller ... on kind 'Kind:1'"), so it fails
+     * and tells us nothing. util/prefs.js reached the same conclusion for its
+     * own kind; this is that lesson applied here.
+     */
+    var dynamicKindReady = false;
+
+    that.ensureDynamicServiceKind = function () {
+        if (dynamicKindReady) {
+            return new Future(true);
+        }
+
+        logger.log("Ensuring db8 kind", DYNAMIC_SERVICE_KIND_ID);
+        var future = DB.putKind(DYNAMIC_SERVICE_KIND_ID, "com.palm.app.backup.service", []);
+        future.then(this, function (f) {
+            if (f.exception) {
+                // Survivable: a concurrent putKind, or the kind already
+                // existing under a different owner. Reads will tell us.
+                logger.warn("putKind failed:", f.exception.message);
+            }
+            dynamicKindReady = true;
+            f.result = true;
+        });
+        return future;
+    };
+
+    /**
      * Registrations added at runtime through our register() method, so a
      * third-party app can join backup without dropping a file in /etc.
      */
@@ -332,7 +372,10 @@ var backup = (function () {
         var future = DB.find({ from: DYNAMIC_SERVICE_KIND_ID });
         future.then(this, function (f) {
             if (f.exception) {
-                // The kind does not exist until something registers.
+                // ensureDynamicServiceKind() runs at startup, so this should
+                // not happen - but a find that fails must not sink a backup
+                // that has perfectly good static registrations.
+                logger.warn("Could not read dynamic services:", f.exception.message);
                 f.result = {};
                 return;
             }
@@ -352,18 +395,14 @@ var backup = (function () {
         serviceDescriptor._id   = getDynamicServiceObjectId(service);
         serviceDescriptor._kind = DYNAMIC_SERVICE_KIND_ID;
 
-        var future = DB.find({
-            from: "Kind:1",
-            where: [{ prop: "id", op: "=", val: DYNAMIC_SERVICE_KIND_ID }]
-        });
+        // Was a find on Kind:1 to decide between del() and putKind(). That
+        // probe is not readable by this caller, so it always took the putKind
+        // branch and never deleted a previous registration - leaving put() to
+        // do the replacing. Ensure the kind, then delete unconditionally.
+        var future = that.ensureDynamicServiceKind();
         future.then(this, function (f) {
-            var kindExists = !f.exception && f.result.results && f.result.results.length > 0;
-            if (kindExists) {
-                f.nest(DB.del([serviceDescriptor._id]));
-            } else {
-                logger.log("Creating dynamic service kind");
-                f.nest(DB.putKind(DYNAMIC_SERVICE_KIND_ID, "com.palm.app.backup.service", []));
-            }
+            var result = f.result;
+            f.nest(DB.del([serviceDescriptor._id]));
         });
         future.then(this, function (f) {
             if (f.exception) {
@@ -386,7 +425,20 @@ var backup = (function () {
      * the stock precedence — an app must not be able to shadow a system
      * service's backup behavior by registering over it.
      */
-    that.loadRegisteredServices = function () {
+    /* The services this device can hand backup data to.
+     *
+     * `options.allProviders` includes the in-process providers whatever the
+     * user's category toggles say. Restore passes it; backup does not.
+     *
+     * The toggles are a backup-time choice - "what goes into a backup" - and
+     * reusing them as a restore-time filter gets the primary case exactly
+     * backwards: a device freshly through a Doctor has every category at its
+     * default, so restoring the backup that was taken to survive that Doctor
+     * would find the provider unregistered and skip the very data it was made
+     * for. What is in the archive was already decided when it was written.
+     */
+    that.loadRegisteredServices = function (options) {
+        var allProviders = !!(options && options.allProviders);
         var allServices = {};
         var dynamicServices = {};
         var toDelete = [];
@@ -420,8 +472,22 @@ var backup = (function () {
         });
         future.then(this, function (f) {
             var userDataEnabled = f.result;
-            if (userDataEnabled) {
+            if (userDataEnabled || allProviders) {
                 allServices[userData.SERVICE_ID] = {
+                    preBackup:   "preBackup",
+                    postRestore: "postRestore",
+                    inProcess:   true
+                };
+            }
+            f.nest(credentials.isEnabled());
+        });
+        future.then(this, function (f) {
+            // Saved passwords are a provider of their own rather than another
+            // userData category: they are not files under /media/internal, they
+            // are one call to keymanager. Same in-process contract, so the
+            // engine needs no special case for either.
+            if (f.result === true || allProviders) {
+                allServices[credentials.SERVICE_ID] = {
                     preBackup:   "preBackup",
                     postRestore: "postRestore",
                     inProcess:   true

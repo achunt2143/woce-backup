@@ -479,6 +479,26 @@ async function main() {
     check("static registrations still load",
         loaded.result["com.example.settings"] !== undefined);
 
+    /* A restore must be able to hand a backup's saved passwords back even
+     * though the Passwords category is off, which is its default - and the
+     * default is exactly the state a device is in after the Doctor the backup
+     * was taken to survive. Gating the restore on the local toggle skipped the
+     * very data the run was for, and did it silently. */
+    check("passwords provider stays out of a backup while the category is off",
+        loaded.result["com.palm.backup.credentials"] === undefined);
+
+    var forRestore = await new Promise(function (resolve) {
+        vm.runInContext("__forRestore = backup.loadRegisteredServices({ allProviders: true });", context);
+        context.__forRestore.settle(function (err, result) { resolve({ error: err, result: result }); });
+    });
+    check("restore registers the passwords provider regardless of the toggle",
+        !forRestore.error && forRestore.result["com.palm.backup.credentials"] !== undefined,
+        forRestore.error && forRestore.error.message);
+    check("the provider restore gets is the in-process one",
+        forRestore.result["com.palm.backup.credentials"] &&
+            forRestore.result["com.palm.backup.credentials"].inProcess === true &&
+            forRestore.result["com.palm.backup.credentials"].postRestore === "postRestore");
+
     var unreg = await run(context, "UnregisterAssistant", { service: "com.example.dynamic" });
     check("unregister succeeds", !unreg.error, unreg.error && unreg.error.message);
 
@@ -588,6 +608,190 @@ async function main() {
     // the call the whole backup depends on — only on the private one, reporting
     // it as an unknown method. That has to route through the root helper, not
     // fail the run: com.palm.db is a required service.
+    /* Installed-app discovery in direct mode.
+     *
+     * Driven with the exact shape two real LuneOS devices produce: a sargo with
+     * two genuinely installed apps, and a tissot whose eleven
+     * waydroid.* entries are appinfo.json shortcuts the Waydroid integration
+     * generates for Android apps. Those carry no opkg record and are recreated
+     * from the Android side, so archiving them would back up stubs and a
+     * restore would plant launcher icons for apps that may be long gone. */
+    section("Installed apps, direct mode");
+
+    var APPS = "/media/cryptofs/apps/usr/palm/applications/";
+    var appFixture = {
+        // What `opkg -o /media/cryptofs/apps list-installed` prints on sargo.
+        opkg: "com.achunt.jukie - 2.0.0\norg.webosarchive.flyingtoasters - 1.1.2\n",
+        dirs: ["com.achunt.jukie", "org.webosarchive.flyingtoasters",
+               "waydroid.org.lineageos.jelly", "waydroid.com.android.settings",
+               "org.webosports.app.restoredbyhand"]
+    };
+
+    var realFs = require("fs");
+    var appCtx = harness.loadService({
+        root: ROOT,
+        services: services,
+        quiet: !process.env.VERBOSE,
+        require: function (name) {
+            if (name === "child_process") {
+                return { exec: function (cmd, opts, cb) {
+                    var done = cb || opts;
+                    if (String(cmd).indexOf("list-installed") !== -1) {
+                        return setTimeout(function () { done(null, appFixture.opkg, ""); }, 1);
+                    }
+                    return setTimeout(function () { done(null, "", ""); }, 1);
+                } };
+            }
+            if (name === "fs") {
+                var shim = Object.create(realFs);
+                shim.readdirSync = function (dir) {
+                    if (dir === APPS) { return appFixture.dirs; }
+                    if (dir === "/usr/palm/applications/") { return ["com.palm.app.email"]; }
+                    return realFs.readdirSync(dir);
+                };
+                shim.readFileSync = function (file, enc) {
+                    var m = String(file).match(/applications\/([^\/]+)\/appinfo\.json$/);
+                    if (m) {
+                        return JSON.stringify({ id: m[1], title: "T-" + m[1], version: "9.9.9" });
+                    }
+                    return realFs.readFileSync(file, enc);
+                };
+                return shim;
+            }
+            return require(name);
+        }
+    });
+    vm.runInContext("privileged.setDirectModeForTesting(true);", appCtx);
+
+    var apps = await new Promise(function (resolve) {
+        vm.runInContext("__apps = privileged.listInstalledApps();", appCtx);
+        appCtx.__apps.settle(function (err, result) { resolve({ error: err, result: result }); });
+    });
+    var ids = ((apps.result && apps.result.packages) || []).map(function (p) { return p.id; }).sort();
+
+    check("the two opkg-installed apps are found",
+        ids.indexOf("com.achunt.jukie") !== -1 &&
+            ids.indexOf("org.webosarchive.flyingtoasters") !== -1,
+        JSON.stringify(ids));
+    check("waydroid shortcuts are not treated as installed apps",
+        ids.filter(function (id) { return id.indexOf("waydroid.") === 0; }).length === 0,
+        JSON.stringify(ids));
+    // An app the directory fallback put back has no opkg record, so opkg cannot
+    // see it - and before it was picked up here it would drop out of every
+    // later backup.
+    check("an app with only a directory is still found, and marked unmanaged",
+        ids.indexOf("org.webosports.app.restoredbyhand") !== -1 &&
+            (apps.result.packages.filter(function (p) {
+                return p.id === "org.webosports.app.restoredbyhand";
+            })[0] || {}).unmanaged === true,
+        JSON.stringify(ids));
+    check("the version comes from opkg, not from appinfo",
+        (apps.result.packages.filter(function (p) {
+            return p.id === "com.achunt.jukie";
+        })[0] || {}).version === "2.0.0");
+    check("system-image apps are reported separately",
+        (apps.result.romApps || []).indexOf("com.palm.app.email") !== -1,
+        JSON.stringify(apps.result.romApps));
+
+    /* Archiving prefers a cached installer over the directory tarball.
+     *
+     * Reinstalling from the .ipk lets opkg rebuild its own bookkeeping instead
+     * of us reconstructing it, so it is worth looking for. woce-backupd looks
+     * only for "<id>.ipk"; what a browser download actually leaves in
+     * /media/internal/downloads is opkg's "<id>_<version>_<arch>.ipk", which
+     * that name never matches - so both spellings are accepted here, and the
+     * version has to match, since reinstalling a stale different version would
+     * be worse than unpacking the directory we know is right. */
+    section("Cached installers");
+
+    var DOWNLOADS = "/media/internal/downloads/";
+    var ipkFixture = { present: [], dirs: [] };
+    var ipkCtx = harness.loadService({
+        root: ROOT, services: services, quiet: !process.env.VERBOSE,
+        require: function (name) {
+            if (name === "child_process") {
+                return { exec: function (cmd, opts, cb) {
+                    var done = cb || opts;
+                    return setTimeout(function () { done(null, "", ""); }, 1);
+                } };
+            }
+            if (name === "fs") {
+                var realFs = require("fs");
+                var shim = Object.create(realFs);
+                shim.statSync = function (t) {
+                    if (ipkFixture.present.indexOf(t) !== -1) { return { isFile: function () { return true; } }; }
+                    if (String(t).indexOf(APPS) === 0) { return { isDirectory: function () { return true; } }; }
+                    return realFs.statSync(t);
+                };
+                shim.readdirSync = function (dir) {
+                    if (dir === DOWNLOADS) { return ipkFixture.dirs; }
+                    if (dir === APPS) { return ["com.example.app"]; }
+                    return realFs.readdirSync(dir);
+                };
+                return shim;
+            }
+            return require(name);
+        }
+    });
+    vm.runInContext("privileged.setDirectModeForTesting(true);", ipkCtx);
+
+    var findIpk = function (id, version, present, listing) {
+        ipkFixture.present = present || [];
+        ipkFixture.dirs = listing || [];
+        ipkCtx.__ipkArgs = { id: id, version: version };
+        vm.runInContext("__ipkFound = privileged.cachedIpkForTesting(__ipkArgs.id, __ipkArgs.version);", ipkCtx);
+        return ipkCtx.__ipkFound;
+    };
+
+    check("the daemon's <id>.ipk name is honoured",
+        findIpk("com.example.app", "1.0.0", [DOWNLOADS + "com.example.app.ipk"]) ===
+            DOWNLOADS + "com.example.app.ipk");
+    check("a browser download's <id>_<version>_<arch>.ipk is found too",
+        findIpk("com.example.app", "1.0.0", [], ["com.example.app_1.0.0_all.ipk"]) ===
+            DOWNLOADS + "com.example.app_1.0.0_all.ipk",
+        String(findIpk("com.example.app", "1.0.0", [], ["com.example.app_1.0.0_all.ipk"])));
+    check("a different version is refused rather than reinstalled",
+        findIpk("com.example.app", "1.0.0", [], ["com.example.app_2.5.0_all.ipk"]) === null);
+    check("another package with a similar name is not matched",
+        findIpk("com.example.app", "1.0.0", [], ["com.example.apples_1.0.0_all.ipk"]) === null);
+    check("nothing cached means nothing found, and the tarball path is used",
+        findIpk("com.example.app", "1.0.0", [], []) === null);
+
+    /* The restore destination allowlist. A backup sits on /media/internal,
+     * which is exported to a PC as USB mass storage, so the paths in its
+     * manifest are untrusted input being handed to a process running as root. */
+    section("Restore destination policy");
+
+    var destCtx = harness.loadService({ root: ROOT, services: services, quiet: !process.env.VERBOSE });
+    var permits = function (p) {
+        destCtx.__destProbe = p;
+        vm.runInContext("__destResult = privileged.isRestorableDest(__destProbe);", destCtx);
+        return destCtx.__destResult;
+    };
+
+    check("a real preferences destination is allowed",
+        permits("/var/preferences/com.palm.display/prefsDB.sl") ===
+            "/var/preferences/com.palm.display/prefsDB.sl");
+    check("a real luna destination is allowed",
+        permits("/var/luna/preferences/universalsearchprefs.db") !== null);
+    check("the media destination is allowed", permits("/media/internal/photo.jpg") !== null);
+    check("an executable destination is refused", permits("/usr/bin/luna-next") === null);
+    check("an init script destination is refused", permits("/etc/init.d/evil") === null);
+    check("a library destination is refused", permits("/lib/ld-linux.so") === null);
+    // Denied even though /var/palm/ itself is allowed: an ls2 role file lets
+    // any caller register as any service on the bus.
+    check("an ls2 role destination is refused inside an allowed root",
+        permits("/var/palm/ls2/roles/anything.json") === null);
+    check("a jail destination is refused inside an allowed root",
+        permits("/var/palm/jail/x") === null);
+    check("the policy matches the 3.0.5 daemon's, root for root",
+        permits("/home/root/x") === null && permits("/etc/palm/luna.conf") === null);
+    check("traversal out of an allowed root is refused",
+        permits("/var/preferences/../../usr/bin/luna-next") === null,
+        String(permits("/var/preferences/../../usr/bin/luna-next")));
+    check("a relative path cannot slip through", permits("../../usr/bin/x") === null);
+    check("an empty destination is refused", permits("") === null && permits(null) === null);
+
     var privCtx = harness.loadService({
         root: ROOT,
         services: buildServices(),
@@ -1390,6 +1594,108 @@ async function main() {
     check("a cached manifest whose content differs from the target is refreshed",
         fs.readFileSync(cachedPath, "utf8") === fs.readFileSync(targetPath, "utf8"),
         "cache still holds: " + fs.readFileSync(cachedPath, "utf8").slice(0, 70));
+
+    /* ---- pathExists and allocBuffer across node vintages ---- */
+    section("Old-node APIs resolve on every runtime this service runs on");
+
+    // The service has to load on webOS 3.0.5's node 0.2 and on LuneOS's node 22,
+    // and the three of them spell "does this path exist" differently. Getting it
+    // wrong is not a graceful degradation: on node 22 the missing path.exists
+    // took the service down inside ServiceAssistant.setup, before it answered
+    // anything at all. Stand in each vintage's fs/path and check the helper both
+    // resolves and answers correctly.
+    //
+    // Only the two properties under test are masked; everything else still comes
+    // from the real modules, so the rest of the service loads normally.
+    // node 0.2 has no Buffer.alloc, only `new Buffer(size)`. A plain object
+    // would not do: the fallback branch constructs it, so the stand-in has to
+    // be constructible. Returning an object from a constructor overrides
+    // `this`, so `new Legacy(4)` yields a real 4-byte Buffer while the type
+    // itself carries no .alloc - which is exactly the shape under test.
+    function bufferVintage(shape) {
+        if (shape !== "node0.2") {
+            return Buffer;
+        }
+        return function (arg) {
+            return Buffer.alloc(typeof arg === "number" ? arg : 0);
+        };
+    }
+
+    function nodeVintage(shape) {
+        var realFs = require("fs");
+        var realPath = require("path");
+        var fakeFs = Object.create(realFs);
+        var fakePath = Object.create(realPath);
+
+        if (shape === "node0.2") {
+            // path.exists only - no fs.exists, no fs.access, no fs.existsSync.
+            fakeFs.access = undefined;
+            fakeFs.exists = undefined;
+            fakePath.exists = function (target, callback) {
+                realFs.stat(target, function (err) { callback(!err); });
+            };
+        } else if (shape === "node0.8") {
+            // fs.exists, but fs.access is not there yet (it arrived in 0.11).
+            fakeFs.access = undefined;
+        }
+        // "modern" masks nothing: fs.access is present and wins.
+
+        return function (name) {
+            if (name === "fs") { return fakeFs; }
+            if (name === "path") { return fakePath; }
+            return require(name);
+        };
+    }
+
+    var presentFile = path.join(ROOT, "pathexists-present");
+    fs.writeFileSync(presentFile, "x");
+    var absentFile = path.join(ROOT, "pathexists-absent");
+
+    var vintages = ["node0.2", "node0.8", "modern"];
+    for (var vi = 0; vi < vintages.length; vi++) {
+        var shape = vintages[vi];
+        var vintageCtx = null;
+        try {
+            vintageCtx = harness.loadService({
+                root: path.join(ROOT, "vintage-" + shape),
+                quiet: true,
+                require: nodeVintage(shape),
+                Buffer: bufferVintage(shape)
+            });
+        } catch (err) {
+            check(shape + ": service loads", false, err.message);
+            continue;
+        }
+        check(shape + ": service loads", true);
+        check(shape + ": pathExists is a function",
+            vm.runInContext("typeof pathExists", vintageCtx) === "function");
+
+        vm.runInContext("__peHits = [];", vintageCtx);
+        vintageCtx.__present = presentFile;
+        vintageCtx.__absent = absentFile;
+        vm.runInContext(
+            "pathExists(__present, function (e) { __peHits.push(['present', e]); });" +
+            "pathExists(__absent,  function (e) { __peHits.push(['absent', e]); });",
+            vintageCtx);
+
+        await new Promise(function (resolve) { setTimeout(resolve, 50); });
+
+        var hits = vm.runInContext("JSON.stringify(__peHits)", vintageCtx);
+        var parsed = JSON.parse(hits);
+        var got = {};
+        parsed.forEach(function (h) { got[h[0]] = h[1]; });
+        check(shape + ": existing path reports true", got.present === true, hits);
+        check(shape + ": missing path reports false", got.absent === false, hits);
+
+        // allocBuffer is the same problem in the other direction: Buffer.alloc
+        // does not exist on 0.2, and new Buffer() is deprecated and slated to
+        // go on 22/24. Both spellings have to keep working.
+        check(shape + ": allocBuffer is a function",
+            vm.runInContext("typeof allocBuffer", vintageCtx) === "function");
+        check(shape + ": allocBuffer returns a buffer of the right size",
+            vm.runInContext("(function(){var b = allocBuffer(7);" +
+                "return (typeof b.length === 'number' ? b.length : -1);}())", vintageCtx) === 7);
+    }
 
     /* ---- summary ---- */
     console.log("\n" + passed + " passed, " + failed + " failed");

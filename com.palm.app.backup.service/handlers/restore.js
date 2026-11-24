@@ -21,7 +21,7 @@
 /*global Future, FILES_PATH, MANIFEST_ROOT, PalmCall, packageOpWrapperBudget,
   serviceCallTimeout, STAGE_ROOT, backup, dateUtil, fileUtil, getParent, isEmpty,
   logger, mapFuture, prefs, privileged, require, system, targets, tolerate,
-  userData, withDeadline, withTimeout */
+  credentials, userData, withDeadline, withTimeout */
 
 // A fresh RestoreAssistant is constructed per call, so this has to live
 // outside it to be visible to the next one. Set for the duration of a
@@ -318,6 +318,9 @@ function RestoreAssistant() {
             if (serviceName === userData.SERVICE_ID) {
                 return userData[method](params);
             }
+            if (serviceName === credentials.SERVICE_ID) {
+                return credentials[method](params);
+            }
             throw new Error("No in-process provider for " + serviceName);
         }
         // Bounded. com.palm.browserServer accepted preBackup and never
@@ -341,8 +344,17 @@ function RestoreAssistant() {
         future.then(this, function (f) {
             var result = f.result;
             if (descriptor.preRestore) {
+                // version as a string. com.palm.db's preBackup *returns* it as
+                // a number (8), but its preRestore schema declares
+                // {"version": {"type": "string"}} with additionalProperties
+                // false, so echoing back what it gave us is rejected:
+                //   invalid type for property 'version'
+                // Measured against db8 3.2.0 once the admin patch made these
+                // methods reachable at all. Stringifying is safe for every
+                // other service: the value only has to round-trip, and a
+                // service that returned a string gets its string back.
                 f.nest(callCallback(serviceId, descriptor.preRestore,
-                    { version: service.version }, descriptor));
+                    { version: String(service.version) }, descriptor));
             } else {
                 f.result = { proceed: true };
             }
@@ -388,10 +400,15 @@ function RestoreAssistant() {
             var filenames = (service.files || []).map(function (file) {
                 return file.path;
             });
+            // No version here. The protocol's postRestore is
+            // postRestore(files, tempDir), and com.palm.db enforces exactly
+            // that - its schema is additionalProperties:false over tempDir and
+            // files, so passing version fails the whole call with
+            //   property not allowed - 'version'
+            // which on a real restore means db8's data never lands.
             f.nest(callCallback(serviceId, descriptor.postRestore, {
                 files:   filenames,
-                tempDir: tempDir,
-                version: service.version
+                tempDir: tempDir
             }, descriptor));
         });
         future.then(this, function (f) {
@@ -543,7 +560,7 @@ function RestoreAssistant() {
         });
         future.then(this, function (f) {
             tempDir = f.result;
-            f.nest(backup.loadRegisteredServices());
+            f.nest(backup.loadRegisteredServices({ allProviders: true }));
         });
         future.then(this, function (f) {
             services = f.result;
@@ -844,10 +861,20 @@ function RestoreAssistant() {
                     };
                 });
 
+                // A wrong passphrase does not fail the restore - everything
+                // else still lands - but it is the one failure the user can do
+                // something about, so it has to travel with the result rather
+                // than only into the log.
+                var credentialsError = credentials.getLastError();
+                if (credentialsError) {
+                    logger.warn("Saved passwords were not restored:", credentialsError);
+                }
+
                 var status = {
                     returnValue:  true,
                     STATUS:       "Complete",
                     manifestName: manifestName,
+                    credentialsError: credentialsError || undefined,
                     skipped:      skipped,
                     packages:     packagesResult,
                     // Lets the UI offer an automatic restart: only the
@@ -859,6 +886,9 @@ function RestoreAssistant() {
                 publish(status);
                 f.result = status;
             } finally {
+                // Whether the restore succeeded or threw, the passphrase has
+                // done its job and must not outlive the run.
+                credentials.setPassphrase(null);
                 if (tempDirFuture) {
                     PalmCall.cancel(tempDirFuture);
                 }
@@ -870,7 +900,11 @@ function RestoreAssistant() {
 
     this.run = function (future, subscription) {
         var args = this.controller.args;
-        logger.log("restore", args);
+        // Not logger.log("restore", args): args now carries the backup
+        // passphrase, and a service log is the last place it should turn up.
+        logger.log("restore", args && args.manifestName, "device", args && args.deviceId);
+
+        credentials.setPassphrase(args.passphrase);
 
         // Confirmed on-device: a second restore call issued ~7s after the
         // first - well past the point where the first's own progress ticks
