@@ -578,6 +578,40 @@ function BackupAssistant() {
         return zeroPad(next, 6) + getManifestNameSuffix(manifest);
     };
 
+    /**
+     * Fills an empty saved-passwords section from this device's last export
+     * when the run had no passphrase - see backup.carryCredentials. Only that
+     * case: with a passphrase the export is fresh or its failure is reported,
+     * and with the category off there is no section to fill.
+     *
+     * Tolerated: a backup that could not look back still has everything it
+     * captured itself, and an empty section says so.
+     */
+    var carryCredentials = function (manifest, manifestName) {
+        var index = -1;
+        manifest.services.forEach(function (service, i) {
+            if (service.service === credentials.SERVICE_ID && service.files.length === 0) {
+                index = i;
+            }
+        });
+        if (index === -1 || credentials.hasPassphrase()) {
+            return new Future(false);
+        }
+
+        var future = tolerate(backup.carryCredentials(target, manifestName,
+            manifest.deviceInfo.nduId), null);
+        future.then(this, function (f) {
+            var carried = f.result;
+            if (carried) {
+                logger.log("No passphrase for saved passwords; carrying forward the export from",
+                    carried.carriedFrom, "of", carried.carriedFromDate);
+                manifest.services[index] = carried;
+            }
+            f.result = !!carried;
+        });
+        return future;
+    };
+
     /* ------------------------------------------------------------ the backup */
 
     /**
@@ -757,6 +791,10 @@ function BackupAssistant() {
             f.nest(mapFuture(serviceList, function (serviceName) {
                 return backupService(serviceName, services, manifest, tempDir, progressIncrement);
             }));
+        });
+        future.then(this, function (f) {
+            var result = f.result;
+            f.nest(carryCredentials(manifest, manifestName));
         });
         future.then(this, function (f) {
             var result = f.result;
@@ -952,10 +990,13 @@ function BackupAssistant() {
                     logger.warn("Saved passwords were not backed up:", credentialsError);
                 }
                 credentials.setPassphrase(null);
+                // Set when the passwords in this backup are an earlier one's.
+                var carriedFrom = backup.describeCredentials(manifest).credentialsCarriedFrom;
                 backup.setStatusComplete({
                     manifestName: manifestName,
                     size:         manifest.size,
                     credentialsError: credentialsError || undefined,
+                    credentialsCarriedFrom: carriedFrom || undefined,
                     skipped:      skipped.length
                 });
                 f.result = {
@@ -964,6 +1005,7 @@ function BackupAssistant() {
                     manifestName: manifestName,
                     size:         manifest.size,
                     credentialsError: credentialsError || undefined,
+                    credentialsCarriedFrom: carriedFrom || undefined,
                     skipped:      skipped
                 };
             } finally {
@@ -1074,10 +1116,31 @@ function BackupAssistant() {
 function ScheduledBackupAssistant() {
     this.run = function (future) {
         logger.log("Scheduled backup firing");
-        var assistant = new BackupAssistant();
-        assistant.controller = this.controller;
-        this.controller.args.scheduled = true;
-        assistant.run(future);
+        var controller = this.controller;
+        var runBackup = function () {
+            var assistant = new BackupAssistant();
+            assistant.controller = controller;
+            controller.args.scheduled = true;
+            assistant.run(future);
+        };
+        // Only our own LuneOS activity asks for this; on legacy webOS the
+        // Activity Manager applies the battery floor before calling. A
+        // skipped day still completes the activity below, so tomorrow's run
+        // stays scheduled.
+        if (controller.args.checkBattery !== true) {
+            runBackup();
+            return;
+        }
+        var check = system.scheduledBackupAllowed();
+        check.then(this, function (f) {
+            if (!f.result) {
+                logger.log("Scheduled backup skipped: battery below " +
+                    system.SCHEDULED_MIN_BATTERY + "% and not charging");
+                future.result = { returnValue: true, STATUS: "Skipped", reason: "battery" };
+                return;
+            }
+            runBackup();
+        });
     };
 
     this.complete = function (activity) {

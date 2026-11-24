@@ -8,7 +8,7 @@
  * connection check is what a Synergy target will need later.
  */
 /*global allocBuffer, Future, PalmCall, logger, isEmpty, platform, require, fileUtil,
-  privileged, tolerate, WORK_ROOT */
+  privileged, tolerate, WORK_ROOT, redactSecrets, redactText */
 
 var system = (function () {
     var that = {};
@@ -78,7 +78,9 @@ var system = (function () {
         var fullUrl = url + "/" + cmd;
         args = args !== undefined ? args : {};
 
-        logger.log("Calling", fullUrl, "with", args);
+        // Redacted here and not only in the logger: args can carry the
+        // backup passphrase and keystore (credentials.js).
+        logger.log("Calling", fullUrl, "with", redactSecrets(args));
         var future = safeCall(url, cmd, args);
         future.then(this, function (f) {
             var err;
@@ -91,7 +93,17 @@ var system = (function () {
             }
 
             if (!isUnreachable(err)) {
-                logger.error("Call to", fullUrl, "failed:", err.message || err);
+                // PalmCall's message interpolates the call's arguments, so a
+                // failed keymanager call would carry the passphrase onward -
+                // into this log, the restore status and the manifest. Scrub
+                // the error itself, not just this line.
+                var scrubbed = redactText(err.message || err);
+                try {
+                    err.message = scrubbed;
+                } catch (readOnly) {
+                    err = new Error(scrubbed);
+                }
+                logger.error("Call to", fullUrl, "failed:", scrubbed);
                 err.serviceId = serviceId;
                 throw err;
             }
@@ -402,11 +414,16 @@ var system = (function () {
         return i > -1 ? ret.substr(0, i) : ret;
     };
 
+    // The battery floor of the stock ScheduledBackup activity.
+    that.SCHEDULED_MIN_BATTERY = 25;
+
     /**
-     * Creates (or replaces) the daily backup activity. Mirrors the stock
+     * The daily backup activity. Mirrors the stock
      * com.palm.service.backup.scheduled activity, under our own name.
+     * `requirements` and the callback params differ by platform; see
+     * createScheduledActivity.
      */
-    that.createScheduledActivity = function () {
+    var scheduledActivity = function (requirements, params) {
         var activity = {
             name: "com.palm.app.backup.service.scheduled",
             description: "Daily woce-backup",
@@ -420,9 +437,6 @@ var system = (function () {
                 persist: true,
                 power: true
             },
-            requirements: {
-                battery: 25
-            },
             // interval only. Adding a start time gets "Unless precise time is
             // specified, time intervals may not specify a start or end time" —
             // the stock ScheduledBackup activity carried the same bare interval.
@@ -431,15 +445,67 @@ var system = (function () {
             },
             callback: {
                 method: "palm://com.palm.app.backup.service/scheduledBackup",
-                params: { scheduled: true }
+                params: params
             }
         };
-
-        return that.palmcall(platform.service("activitymanager"), "create", {
+        if (requirements) {
+            activity.requirements = requirements;
+        }
+        return {
             activity: activity,
             start: true,
             replace: true
+        };
+    };
+
+    /**
+     * Creates (or replaces) the daily backup activity.
+     *
+     * Legacy webOS gets the stock spec, whose Activity Manager holds the run
+     * until the battery is at SCHEDULED_MIN_BATTERY percent. LuneOS's Activity
+     * Manager has no battery requirement - only bootup, internet and wifi, each
+     * taking only `true` - and refuses the stock spec outright ("If 'battery'
+     * requirement is specified, the only legal value is 'true'"), which left
+     * the daily backup unscheduled. There it gets our own spec instead: no
+     * requirement, and checkBattery in the callback params so the scheduled
+     * run applies the floor itself (scheduledBackupAllowed).
+     */
+    that.createScheduledActivity = function () {
+        var spec = platform.isModernBus()
+            ? scheduledActivity(null, { scheduled: true, checkBattery: true })
+            : scheduledActivity({ battery: that.SCHEDULED_MIN_BATTERY }, { scheduled: true });
+        return that.palmcall(platform.service("activitymanager"), "create", spec);
+    };
+
+    /**
+     * Whether a scheduled backup may run now: on charger power, or with the
+     * battery at SCHEDULED_MIN_BATTERY percent or more - what the legacy
+     * Activity Manager enforces through the activity's battery requirement.
+     * A reading that cannot be had does not hold the backup up.
+     */
+    that.scheduledBackupAllowed = function () {
+        var future = safeCall(POWER_SERVICE_URL, "com/palm/power/batteryStatusQuery", {});
+        future.then(this, function (f) {
+            var level = null;
+            if (!f.exception) {
+                var result = f.result;
+                level = result.percent_ui !== undefined ? result.percent_ui : result.percent;
+            }
+            if (typeof level !== "number" || level >= that.SCHEDULED_MIN_BATTERY) {
+                f.result = true;
+                return;
+            }
+            f.nest(safeCall(POWER_SERVICE_URL, "com/palm/power/chargerStatusQuery", {}));
         });
+        future.then(this, function (f) {
+            if (f.exception) {
+                f.result = false;
+                return;
+            }
+            var result = f.result;
+            f.result = result === true || result.connected === true;
+        });
+        return future;
     };
 
     /**

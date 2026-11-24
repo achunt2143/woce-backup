@@ -11,7 +11,7 @@
  * why.
  */
 /*global credentials, DB, Future, FILES_PATH, MANIFESTS_PATH, RECEIPTS_PATH, MANIFEST_ROOT, fileUtil,
-  logger, mapFuture, privileged, removeAll, require, system, userData, isEmptyObject,
+  logger, mapFuture, privileged, removeAll, require, restorePolicy, system, userData, isEmptyObject,
   STATIC_SERVICES_ROOT,
   zeroPad, dateUtil */
 
@@ -729,17 +729,57 @@ var backup = (function () {
      * rejects, so one unreachable manifest cannot abort the sync for the rest
      * (mapFuture chains sequentially and an exception would strand the others).
      */
+    var refetchSeq = 0;
     var refetchManifest = function (target, name, failed) {
-        var future = target.get(MANIFESTS_PATH + name, MANIFEST_ROOT + name);
+        // Fetched beside the cached copy and renamed over it, never written
+        // into it: cp() truncates its destination on open, and several syncs
+        // routinely overlap (refreshAll fires listBackups and getLastBackupTime
+        // together). A handler reading the cache mid-copy got an empty file,
+        // skipped it as unreadable, and the app showed "0 backups" with one
+        // there. rename() swaps the whole file in, so a reader sees the old
+        // copy or the new one. The suffix is unique per fetch so two syncs
+        // cannot share a scratch file, and the dot keeps it out of
+        // MANIFEST_NAME_REGEX, so listLocalManifests never reports it.
+        //
+        // A failure is recorded in fetchError and handled at the end rather
+        // than rethrown through the chain: Foundations logs every rethrow, and
+        // the warning below already says what went wrong.
+        var scratch = MANIFEST_ROOT + name + ".sync-" + (++refetchSeq);
+        var fetchError = null;
+        var future = target.get(MANIFESTS_PATH + name, scratch);
         future.then(this, function (f) {
-            if (!f.exception) {
+            if (f.exception) {
+                fetchError = f.exception;
+                f.result = false;
+                return;
+            }
+            var swap = fileUtil.mv(scratch, MANIFEST_ROOT + name);
+            swap.then(this, function (sf) {
+                if (sf.exception) {
+                    fetchError = sf.exception;
+                }
+                sf.result = true;
+            });
+            f.nest(swap);
+        });
+        future.then(this, function (f) {
+            var done = f.result;
+            if (!fetchError) {
                 f.result = name;
                 return;
             }
-            logger.warn("Could not fetch manifest", name, "-", f.exception.message,
+            logger.warn("Could not fetch manifest", name, "-", fetchError.message,
                 "- dropping the cached copy rather than trusting it");
             failed.push(name);
-            var cleanup = fileUtil.rmIfExists(MANIFEST_ROOT + name);
+            var cleanup = fileUtil.rmIfExists(scratch);
+            cleanup.then(this, function (cf) {
+                // Reading exception marks it handled; assigning would fire the
+                // next callback before the nest below completes.
+                if (cf.exception) {
+                    logger.warn("Could not remove", scratch, "-", cf.exception.message);
+                }
+                cf.nest(fileUtil.rmIfExists(MANIFEST_ROOT + name));
+            });
             cleanup.then(this, function (cf) {
                 cf.exception = undefined;   // handled: do not strand the chain
                 cf.result = name;
@@ -812,6 +852,28 @@ var backup = (function () {
             });
             work.then(this, function (wf) {
                 var result = wf.result;
+                if (stale.length === 0) {
+                    wf.result = result;
+                    return;
+                }
+                // Ask the target again right before deleting anything. The
+                // listing above may predate a backup that finished during
+                // the re-fetch: storeManifest writes the target and then the
+                // cache, so its new manifest is in our local listing but not
+                // in that target listing, and would be dropped as stale.
+                wf.nest(target.list(MANIFESTS_PATH));
+            });
+            work.then(this, function (wf) {
+                var entries = wf.result;
+                if (stale.length > 0) {
+                    var present = {};
+                    (entries || []).forEach(function (entry) {
+                        if (!entry["Is-Folder"]) {
+                            present[entry.Name] = true;
+                        }
+                    });
+                    stale = stale.filter(function (name) { return !present[name]; });
+                }
                 wf.nest(mapFuture(stale, function (name) {
                     logger.log("Dropping stale cached manifest", name);
                     return fileUtil.rmIfExists(MANIFEST_ROOT + name);
@@ -1002,6 +1064,217 @@ var backup = (function () {
                 });
                 f.nest(del);
             }
+        });
+        return future;
+    };
+
+    /* ------------------------------------------------------ saved passwords */
+
+    var isArray = function (value) {
+        return Object.prototype.toString.call(value) === "[object Array]";
+    };
+
+    var credentialsSectionOf = function (manifest) {
+        var found = null;
+        ((manifest && isArray(manifest.services)) ? manifest.services : []).forEach(function (service) {
+            if (service && service.service === credentials.SERVICE_ID) {
+                found = service;
+            }
+        });
+        return found;
+    };
+
+    /**
+     * What a manifest holds in the way of saved passwords, for the backup list,
+     * the restore picker and the restore receipt.
+     *
+     *   hasCredentials          an encrypted keystore export is in the backup
+     *   credentialsSkipped      the category was on, but nothing was captured
+     *                           (no passphrase, or the export failed)
+     *   credentialsCarriedFrom  the manifest the export was captured in, when
+     *                           this backup reused it (see carryCredentials)
+     *   credentialsAsOf         when that export was captured
+     *
+     * `stored`, when given, is getStoredFileMap's answer: an export whose file
+     * is no longer in the store does not count, since there is nothing left
+     * to restore. Without it (or with an empty map, which is what an
+     * unreadable store looks like) only the manifest is consulted.
+     */
+    that.describeCredentials = function (manifest, stored) {
+        var section = credentialsSectionOf(manifest);
+        var has = !!section && isArray(section.files) && section.files.length > 0;
+        if (has && stored && !isEmptyObject(stored)) {
+            section.files.forEach(function (file) {
+                if (!file || !stored[that.getServerFilename(file)]) {
+                    has = false;
+                }
+            });
+        }
+        var carried = has && typeof section.carriedFrom === "string" ? section.carriedFrom : null;
+        var asOf = null;
+        if (has) {
+            asOf = carried ? (section.carriedFromDate || null) : (manifest.finished || null);
+        }
+        return {
+            hasCredentials:         has,
+            credentialsSkipped:     !!section && !has,
+            credentialsCarriedFrom: carried,
+            credentialsAsOf:        asOf
+        };
+    };
+
+    /**
+     * For every entry without saved passwords, names the newest backup in its
+     * chain that has them (credentialsBackup: {manifestName, date}), so the
+     * restore UI can point there instead of restoring none.
+     *
+     * Entries are grouped by their nduId, the key manifests are named, trimmed
+     * and listed by; a caller that has already grouped them by device can pass
+     * entries without one. Each entry needs manifestName, date and
+     * hasCredentials (describeCredentials).
+     */
+    that.linkCredentialBackups = function (entries) {
+        var newest = {};
+        entries.forEach(function (entry) {
+            var key = String(entry.nduId || "");
+            var number = that.parseManifestName(entry.manifestName).number;
+            if (entry.hasCredentials && (!newest[key] || number > newest[key].number)) {
+                newest[key] = { number: number, manifestName: entry.manifestName, date: entry.date };
+            }
+        });
+        entries.forEach(function (entry) {
+            var found = entry.hasCredentials ? null : newest[String(entry.nduId || "")];
+            entry.credentialsBackup = found
+                ? { manifestName: found.manifestName, date: found.date || null }
+                : null;
+        });
+        return entries;
+    };
+
+    /**
+     * The credentials section for a backup that could not capture its own:
+     * the last export this device made, carried forward by reference.
+     *
+     * A run without a passphrase (the scheduled daily backup, or Back Up Now
+     * without one) cannot ask keymanager for a fresh export, and used to write
+     * an empty section. Restoring the newest backup - the obvious choice - then
+     * brought the accounts back with no passwords and said nothing. The export
+     * is ciphertext under the passphrase it was made with and is stored by its
+     * checksum, so the newer manifest can simply reference the same file:
+     * nothing is decrypted, re-encrypted or copied, and no passphrase is
+     * needed. Restoring it takes the passphrase of the backup it came from,
+     * which is why the section records that backup and its date.
+     *
+     * Only this device's chain: manifests whose name AND recorded nduId are
+     * this run's. That is the key names, trimming (purge) and the restore
+     * picker (getRestoreDevices) already group by. deviceId is not used: it
+     * comes from com.palm.deviceprofile when that answers and falls back to
+     * the nduId when it does not, so it can change between two runs on the
+     * same device. An unknown nduId carries nothing, since every device that
+     * failed to read one shares the name "Unknown".
+     *
+     * Only entries shaped like the ones credentials.js writes (one staged
+     * keystore export, a plain stored name) are carried - a manifest is
+     * USB-writable, and a crafted section must not be propagated into every
+     * later backup - and only when every file it names is still in the store.
+     *
+     * Resolves to the section, or null when there is nothing to carry.
+     */
+    that.carryCredentials = function (target, manifestName, nduId) {
+        var current = that.parseManifestName(manifestName).number;
+        var candidates = [];
+
+        if (!nduId || nduId === that.UNKNOWN_NDUID) {
+            return new Future(null);
+        }
+
+        var future = that.listLocalManifests(false);
+        future.then(this, function (f) {
+            var names = f.exception ? [] : (f.result || []);
+            names.forEach(function (name) {
+                var info = that.parseManifestName(name);
+                if (info.nduId === nduId && info.number < current) {
+                    candidates.push({ name: name, number: info.number });
+                }
+            });
+            candidates.sort(function (a, b) { return b.number - a.number; });
+            f.nest(that.getStoredFileMap(target));
+        });
+        future.then(this, function (f) {
+            var stored = f.exception ? {} : (f.result || {});
+            var carried = null;
+
+            for (var i = 0; i < candidates.length && !carried; i++) {
+                var manifest;
+                try {
+                    manifest = that.loadManifest(candidates[i].name);
+                } catch (err) {
+                    continue;
+                }
+                var deviceInfo = manifest.deviceInfo || {};
+                if (deviceInfo.nduId && deviceInfo.nduId !== nduId) {
+                    continue;
+                }
+                var section = credentialsSectionOf(manifest);
+                if (!section || !isArray(section.files) || section.files.length === 0) {
+                    continue;
+                }
+
+                var files = [];
+                var usable = true;
+                section.files.forEach(function (file) {
+                    if (!usable || !file || file.path !== credentials.STAGED_NAME ||
+                            typeof file.origChecksum !== "string") {
+                        usable = false;
+                        return;
+                    }
+                    var copy = {
+                        path:          file.path,
+                        origSize:      file.origSize,
+                        origChecksum:  file.origChecksum,
+                        compressed:    file.compressed === true,
+                        finalSize:     file.finalSize,
+                        finalChecksum: file.finalChecksum,
+                        "new":         false
+                    };
+                    var storedName = that.getServerFilename(copy);
+                    if (!restorePolicy.isValidStoredName(storedName) || !stored[storedName]) {
+                        // Missing from files/ (pruned, or a manifest copied in
+                        // without its files): referencing it would only make a
+                        // backup that looks like it has passwords and does not.
+                        usable = false;
+                        return;
+                    }
+                    files.push(copy);
+                });
+                if (!usable) {
+                    logger.warn("Not carrying saved passwords forward from", candidates[i].name,
+                        "- its keystore export is missing or not one this service wrote");
+                    // Older ones would be older still, and the newest unusable
+                    // one is the export the user last made: stop here.
+                    break;
+                }
+
+                // Carried from a backup that itself carried it: name where it
+                // was really captured, so the date is the one that matters.
+                var origin = typeof section.carriedFrom === "string" ? section.carriedFrom : candidates[i].name;
+                var originDate = typeof section.carriedFrom === "string"
+                    ? (section.carriedFromDate || null) : (manifest.finished || null);
+                var size = 0;
+                files.forEach(function (file) { size += (file.finalSize || 0); });
+                carried = {
+                    service:         credentials.SERVICE_ID,
+                    size:            size,
+                    files:           files,
+                    version:         section.version,
+                    description:     "Saved passwords carried forward from the backup of " +
+                        (originDate || origin) + " (no passphrase for this run); " +
+                        "restoring them takes that backup's passphrase",
+                    carriedFrom:     origin,
+                    carriedFromDate: originDate
+                };
+            }
+            f.result = carried;
         });
         return future;
     };
