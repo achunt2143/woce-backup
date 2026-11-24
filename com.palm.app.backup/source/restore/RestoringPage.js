@@ -94,7 +94,7 @@ enyo.kind({
             ]}
         ]},
 
-        { name: "passphrasePopup", className: "box-center popup", kind: "ModalDialog",
+        { name: "passphrasePopup", className: "box-center popup", kind: "ModalDialog", lazy: false,
           caption: $L("Backup passphrase"), components: [
             { className: "backup-info-text",
               content: $L("This backup contains saved passwords. Enter the passphrase you chose when it was made. Skip it and everything else still restores - you will just re-enter your passwords.") },
@@ -181,6 +181,9 @@ enyo.kind({
         if (this.params.hasCredentials && !this.params.passphrase && !this.passphraseAsked) {
             this.passphraseAsked = true;
             this.$.passphraseInput.setValue("");
+            // No call is outstanding while the prompt is up, and Accept/Skip
+            // come back through here - left set, they would no-op.
+            this.awaitingResponse = false;
             this.$.passphrasePopup.openAtCenter();
             return;
         }
